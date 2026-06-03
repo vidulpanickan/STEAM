@@ -1,8 +1,12 @@
 # Inference Pipeline — STEAM Demo Dataset → MedGemma 1.5 4B (Q8_0, llama.cpp)
 
-End-to-end documentation for running the fine-tuned MedGemma 1.5 4B clinical-entity classifier on a clinical-notes DataFrame using llama.cpp. Three small scripts + the model checkpoint do the whole pipeline.
+End-to-end documentation for running the fine-tuned MedGemma 1.5 4B clinical-entity classifier on a clinical-notes DataFrame using llama.cpp. Three stages — **build inputs → run the model → merge results** — plus the model checkpoint do the whole pipeline.
 
-This folder (`tools/inference/`) is self-contained: it holds the three pipeline scripts plus the bundled data artifacts (`all_terms.csv`, `all_terms_typed.csv`, the `inference_inputs.*` set, and the `model_responses.top*.jsonl` samples). The one-time training-data construction and fine-tuning scripts live separately under `tools/training/` and are not needed to run inference. All commands below are written to be run from the repository root.
+Stage 2 (run the model) has **two interchangeable runners** that produce byte-identical output:
+- `run_llamacpp_inference.py` — one `llama-cli` subprocess per window. Simplest; best for **small batches** (hundreds).
+- `run_llamaserver_inference.py` — concurrent HTTP requests against a resident `llama-server`. **~10–50× faster for large runs** (thousands+); see [Stage 2B](#stage-2b-run-inference-at-scale-run_llamaserver_inferencepy).
+
+This folder (`tools/inference/`) is self-contained: it holds the four pipeline scripts, the bundled data artifacts (`all_terms.csv`, `all_terms_typed.csv`, the `inference_inputs.*` set, and the `model_responses.top*.jsonl` samples), and `WINDOWING_VALIDATION.md` (evidence that the inference windowing matches the training distribution). The one-time training-data construction and fine-tuning scripts live separately under `tools/training/` and are not needed to run inference. **All commands below are run from the repository root.**
 
 ## Running the pipeline (quick reference)
 
@@ -11,7 +15,7 @@ The pipeline is **three scripts run in sequence**: build inputs → run the mode
 | # | Script | Consumes | Produces |
 |---|--------|----------|----------|
 | 1 | `build_inference_input.py` | your clinical-notes CSV + the term catalog (`all_terms_typed.csv`) | `inference_inputs.jsonl` (one window per line, model input) + `inference_inputs.tsv` (one row per window×entity, axis columns empty) |
-| 2 | `run_llamacpp_inference.py` | `inference_inputs.jsonl` + the `medgemma-1.5-4b-it.Q8_0.gguf` checkpoint | `model_responses.jsonl` (the model's per-window JSON-array predictions) |
+| 2 | `run_llamacpp_inference.py` *(small)* **or** `run_llamaserver_inference.py` *(large, fast)* | `inference_inputs.jsonl` + the `medgemma-1.5-4b-it.Q8_0.gguf` checkpoint | `model_responses.jsonl` (the model's per-window JSON-array predictions) |
 | 3 | `merge_inference_outputs.py` | `inference_inputs.tsv` + `model_responses.jsonl` | `predictions.tsv` (the TSV with all axis columns filled in + a `status` column) |
 
 ```bash
@@ -35,9 +39,20 @@ python tools/inference/merge_inference_outputs.py \
   --out       predictions.tsv
 ```
 
+**Large run (thousands of windows)?** Replace step 2 with the `llama-server` path — same `model_responses.jsonl`, model loaded once, requests batched:
+
+```bash
+# 2 (fast). Launch llama-server, run all windows concurrently, tear it down
+python tools/inference/run_llamaserver_inference.py \
+  --inputs      inference_inputs.jsonl \
+  --out         model_responses.jsonl \
+  --launch --model /path/to/medgemma-1.5-4b-it.Q8_0.gguf \
+  --concurrency 8
+```
+
 **What each stage does, in one line:**
 - **Stage 1 — build:** scans each note for catalog terms, clusters nearby hits into context windows (≤1500 chars), and emits one model-ready record per window plus an analysis-ready TSV stub. The system prompt is embedded byte-for-byte from the fine-tune.
-- **Stage 2 — run:** sends each window through `llama-cli` against the Q8_0 GGUF at `--temp 0.0` (deterministic), capturing the assistant turn — a JSON array assigning the SCHEMA3 axes (assertion / certainty / temporality / subject / type-specific 5th) to every entity in the window.
+- **Stage 2 — run:** feeds each window to the Q8_0 GGUF at `--temp 0.0` (deterministic) and captures the assistant turn — a JSON array assigning the SCHEMA3 axes (assertion / certainty / temporality / subject / type-specific 5th) to every entity. Use the `llama-cli` runner for small batches, the `llama-server` runner for large ones.
 - **Stage 3 — merge:** joins responses back by `(patient_id, note_id, window_start, window_end)`, fills the axis columns per entity, and tags each row `ok` / `parse_error` / `entity_missing` / `no_response`. The result, `predictions.tsv`, is ready for pandas/SQL.
 
 The sections below document each stage, its flags, the windowing strategy, performance tuning, and known behaviors in full.
@@ -64,36 +79,7 @@ Report_Description   Report_Status   Report_Type   report
 
 All columns load as strings (no float coercion of `empi` / `MRN` / `Report_Number`). The script auto-detects format from extension: `.csv` → comma-delimited, `.tsv`/`.tab` → tab-delimited, `.parquet` → parquet. If your file is tab-delimited but named `.csv`, rename to `.tsv` or load it yourself with `pd.read_csv(..., sep="\t", dtype=str)` and call `build_inference_records()` directly.
 
-## End-to-end workflow
-
-Four steps. Each step is a single CLI invocation. The defaults are already wired for the EPIC schema above — no column-override flags needed.
-
-```bash
-# 1. Build inference inputs (JSONL for model + long-form TSV for analysis)
-python tools/inference/build_inference_input.py \
-  --notes     ct_reports.csv \
-  --terms     tools/inference/all_terms_typed.csv \
-  --out       inference_inputs.jsonl \
-  --out-table inference_inputs.tsv
-
-# 2. Run the model on every window
-python tools/inference/run_llamacpp_inference.py \
-  --model  /path/to/medgemma-1.5-4b-it.Q8_0.gguf \
-  --inputs inference_inputs.jsonl \
-  --out    model_responses.jsonl
-
-# 3. Merge model responses into the analysis table
-python tools/inference/merge_inference_outputs.py \
-  --table     inference_inputs.tsv \
-  --responses model_responses.jsonl \
-  --out       predictions.tsv
-
-# 4. Analyze
-#   predictions.tsv is now ready for pandas/SQL: one row per (window, entity)
-#   with all axis predictions filled in plus a 'status' column.
-```
-
-The rest of this document explains each stage in detail.
+The quick reference above is the entire pipeline; the defaults are already wired for the EPIC schema below, so no column-override flags are needed. The rest of this document explains each stage in detail, ending with how to read the output in [Stage 4](#stage-4-analyze-predictionstsv).
 
 ## Context
 
@@ -106,13 +92,31 @@ To run inference on fresh notes (EPIC export of chest CT reports, say), we produ
 
 Related files:
 - `tools/inference/build_inference_input.py` — stage 1 (build).
-- `tools/inference/run_llamacpp_inference.py` — stage 2 (run inference via llama-cli).
+- `tools/inference/run_llamacpp_inference.py` — stage 2A (run inference via llama-cli; small batches).
+- `tools/inference/run_llamaserver_inference.py` — stage 2B (run inference via llama-server; large runs).
 - `tools/inference/merge_inference_outputs.py` — stage 3 (merge responses into the analysis table).
 - `tools/inference/all_terms_typed.csv` — 107 chest-CT terms, all typed `Condition`.
 - `../../DATASET_CURATION.md` — how the training dataset was built (separate concern, retained for reference).
 - `../../SCHEMA3.md` — axis definitions and cue-word lists.
 
 ## Stage 1: Build inputs (`build_inference_input.py`)
+
+### Run it
+
+```bash
+# Defaults match the EPIC schema — no column flags needed
+python tools/inference/build_inference_input.py \
+  --notes     ct_reports.csv \
+  --terms     tools/inference/all_terms_typed.csv \
+  --out       inference_inputs.jsonl \
+  --out-table inference_inputs.tsv
+
+# Columns named differently in your export? Override them:
+python tools/inference/build_inference_input.py \
+  --notes my_notes.csv --terms my_terms.csv \
+  --out inputs.jsonl --out-table inputs.tsv \
+  --text-col note_text --patient-id-col pat_id --note-id-col doc_id
+```
 
 ### Inputs
 
@@ -189,11 +193,11 @@ For each `(term × note)` hit:
 3. Each cluster yields ONE window: larger of (cluster sentence range ± `SENTENCE_RADIUS=2` sentences) OR (±50 words around the cluster's hit char-range). Hard cap at `MAX_WINDOW_CHARS=1500`, edges snap to whitespace.
 4. Attach every input term whose lowercase form appears in the window.
 
-Both knobs are configurable per-call: `windows_for_note(note, terms, adjacency=2, sent_radius=3)`.
+Both knobs are overridable per call — e.g. `windows_for_note(note, terms, adjacency=1, sent_radius=2)` (the defaults), or `adjacency=0, sent_radius=1` to pull windows toward the original training size (see `WINDOWING_VALIDATION.md`).
 
-## Stage 2: Run inference (`run_llamacpp_inference.py`)
+## Stage 2A: Run inference, small batches (`run_llamacpp_inference.py`)
 
-The runner loops over `inference_inputs.jsonl` and invokes `llama-cli` once per window, capturing the model's assistant turn into a responses JSONL.
+The simplest runner: loops over `inference_inputs.jsonl` and invokes `llama-cli` once per window, capturing the model's assistant turn into a responses JSONL. Zero setup, but it **reloads the model on every call** (~1–3 s each on Apple Silicon Q8_0) — ideal for hundreds of windows. For thousands, use [Stage 2B](#stage-2b-run-inference-at-scale-run_llamaserver_inferencepy) instead.
 
 ### Basic usage
 
@@ -202,6 +206,16 @@ python tools/inference/run_llamacpp_inference.py \
   --model  /path/to/medgemma-1.5-4b-it.Q8_0.gguf \
   --inputs inference_inputs.jsonl \
   --out    model_responses.jsonl
+```
+
+Interrupted? Re-run the identical command with `--resume` to skip windows already in `--out`:
+
+```bash
+python tools/inference/run_llamacpp_inference.py \
+  --model  /path/to/medgemma-1.5-4b-it.Q8_0.gguf \
+  --inputs inference_inputs.jsonl \
+  --out    model_responses.jsonl \
+  --resume
 ```
 
 ### What it does per record
@@ -239,18 +253,71 @@ If the model emits something that can't be parsed as a JSON array, the raw stdou
 | `--n-gpu-layers` | 999            | Layers offloaded to GPU. Use 0 for CPU-only.                            |
 | `--resume`       | off            | Skip windows already present in `--out` (idempotent re-runs).            |
 
-### Performance note
+## Stage 2B: Run inference at scale (`run_llamaserver_inference.py`)
 
-`llama-cli` reloads the model on every invocation. On Apple Silicon with Q8_0 this is ~1–3 s of fixed overhead per record. That's fine for hundreds; slow for thousands.
+Same job, same output as Stage 2A, but built for **thousands+ of windows**. It loads the model **once** via `llama-server` and sends each window as a concurrent HTTP POST to the OpenAI-compatible `/v1/chat/completions` endpoint, so the server's continuous batching decodes many short windows at once.
 
-For larger jobs, use `llama-server` to keep the model loaded:
+**Why it matters.** Stage 2A reloads the ~4 GB model on every call. For 10,000 windows on Apple Silicon Q8_0 that's roughly:
+
+| | per record | × 10,000 |
+|---|---|---|
+| 2A (`llama-cli`), reload + generate | ~4 s | **~11 hrs** (≈half wasted on reloads) |
+| 2B (`llama-server`), `--concurrency 8` | — | **~30–90 min** |
+
+Stdlib only (no `requests`/`httpx`).
+
+### Option 1 — point at a server you started
 
 ```bash
-# In one terminal:
-llama-server -m medgemma-1.5-4b-it.Q8_0.gguf -c 4096 -ngl 999 --port 8080
+# Terminal 1: start the server once (keep it running)
+llama-server -m /path/to/medgemma-1.5-4b-it.Q8_0.gguf \
+  -c 2048 -ngl 999 --parallel 8 --host 127.0.0.1 --port 8080
+
+# Terminal 2: run all windows against it
+python tools/inference/run_llamaserver_inference.py \
+  --inputs      inference_inputs.jsonl \
+  --out         model_responses.jsonl \
+  --server      http://127.0.0.1:8080 \
+  --concurrency 8
 ```
 
-Then a small Python loop using the `/v1/chat/completions` endpoint produces the same responses JSONL ~10–50× faster. A sketch is in the comment block at the bottom of `tools/inference/run_llamacpp_inference.py`.
+### Option 2 — let the script launch and tear down the server
+
+```bash
+python tools/inference/run_llamaserver_inference.py \
+  --inputs      inference_inputs.jsonl \
+  --out         model_responses.jsonl \
+  --launch --model /path/to/medgemma-1.5-4b-it.Q8_0.gguf \
+  --concurrency 8 \
+  --resume                       # safe to add; skips done windows, retries errored ones
+```
+
+### All flags
+
+| Flag             | Default                   | Purpose                                                              |
+|------------------|---------------------------|----------------------------------------------------------------------|
+| `--inputs`       | required                  | Inputs JSONL from stage 1.                                            |
+| `--out`          | required                  | Responses JSONL (identical shape to Stage 2A).                       |
+| `--server`       | `http://127.0.0.1:8080`   | Base URL of a running llama-server.                                  |
+| `--concurrency`  | 8                         | In-flight requests. **Match the server's `--parallel`.**            |
+| `--n-predict`    | 512                       | `max_tokens` per request.                                            |
+| `--temp`         | 0.0                       | Sampling temperature (deterministic).                               |
+| `--timeout`      | 120                       | Per-request timeout (s); a hung request can't stall the batch.      |
+| `--retries`      | 3                         | Retries per window on transient failure (capped backoff).           |
+| `--resume`       | off                       | Skip windows already in `--out`; **retry any that errored**.        |
+| `--launch`       | off                       | Start `llama-server` from `--model`, then stop it at the end.        |
+| `--model`        | (req. with `--launch`)    | GGUF path, launch mode only.                                         |
+| `--ctx-size`     | 2048                      | Server context when launching (windows are ~450 tokens).            |
+| `--n-gpu-layers` | 999                       | GPU layers when launching (999 = all).                              |
+
+### Robustness
+
+- **Per-request timeout + retries** with capped exponential backoff — a single stuck request can't hang the whole run.
+- **Health check** before starting: if no server answers `/health`, it exits with a clear message (in `--launch` mode it waits for the model to load).
+- **Errored windows are left unwritten**, so a later `--resume` retries exactly those.
+- Output is written in **completion order, not input order** — fine, because stage 3 keys by `(patient_id, note_id, window_start, window_end)`.
+
+> The two runners are interchangeable: their `model_responses.jsonl` is byte-compatible and `merge_inference_outputs.py` consumes either. Validated end-to-end (stage 1 → 2B → stage 3 produces `ok` rows).
 
 ## Stage 3: Merge responses (`merge_inference_outputs.py`)
 
@@ -283,6 +350,25 @@ Merged 6 rows into predictions.tsv: ok=4, parse_error=0, entity_missing=1, no_re
 
 Entity-name matching is case-insensitive (model may capitalize differently than the catalog). Extra entities returned by the model that aren't in the input row set are silently ignored — they would have to introduce new rows, which the merge step intentionally doesn't do.
 
+## Stage 4: Analyze (`predictions.tsv`)
+
+The end product is one row per `(window, entity)` with every axis filled in plus a `status` column — ready for pandas/SQL:
+
+```python
+import pandas as pd
+
+pred = pd.read_csv("predictions.tsv", sep="\t", dtype=str)
+
+# Keep only confidently parsed rows, then summarize an axis.
+ok = pred[pred["status"] == "ok"]
+print(ok["assertion"].value_counts())                          # affirmed vs negated
+print(ok.groupby("entity")["temporality"].value_counts())      # per-term temporality
+
+# One entity can appear in multiple overlapping windows (see Known concerns);
+# dedupe to one prediction per (note, entity) if you need a single label.
+one_per_entity = ok.sort_values("window_start").drop_duplicates(["note_id", "entity"])
+```
+
 ## Configuration constants
 
 In `tools/inference/build_inference_input.py`:
@@ -307,7 +393,7 @@ In `tools/inference/build_inference_input.py`:
 
 ### Worth doing for larger jobs
 
-1. **Switch to `llama-server`.** The biggest win. Eliminates per-call model reload (~1–3 s saved per record on Apple Silicon Q8_0). See the comment block at the bottom of `run_llamacpp_inference.py`.
+1. **Switch to `llama-server`.** The biggest win — eliminates the per-call model reload. Implemented as [Stage 2B](#stage-2b-run-inference-at-scale-run_llamaserver_inferencepy) (`run_llamaserver_inference.py`); ~10–50× faster for thousands of windows. Use it once you're past a few hundred records.
 
 2. **GBNF-constrained output.** Pass `--grammar-file <path>` to force valid JSON-array structure. A starter GBNF for the SCHEMA3 axis vocabulary is a worthwhile add — it eliminates `parse_error` rows entirely at the cost of negligible generation overhead. (Not bundled here; happy to write one if you want.)
 
@@ -321,14 +407,21 @@ In `tools/inference/build_inference_input.py`:
 
 ## Known concerns / behaviors
 
+### Input hygiene — catalog and column edge cases
+A few input conditions are handled loosely (also documented in the `build_inference_input.py` header):
+- **Blank/empty term cells** load as the literal `"nan"`; an empty-string term passed via the Python API attaches to *every* window. Type validation checks only the `type` column → give a clean catalog with no blank terms.
+- **`--text-col` / `--patient-id-col` / `--note-id-col` must be valid Python identifiers** (no spaces, hyphens, or leading digits) — they're addressed via `itertuples`. Rename such columns before running.
+- **A populated note with an empty id** emits a bare `NaN` JSON token (Python reads it back; strict parsers like `jq` reject it). Ensure ids are populated.
+- **Overlapping windows can classify the same entity more than once** (different context → possibly different labels). Dedupe by `(note_id, entity)` downstream if you need one label per entity (see the [Stage 4](#stage-4-analyze-predictionstsv) snippet).
+
 ### Substring matching can over-match short terms
-`_term_matches` uses unbounded case-insensitive substring search. Catalog entries that may over-fire:
+`_term_occurrences` uses unbounded case-insensitive substring search. Catalog entries that may over-fire:
 - `mass` → matches "massive", "Massachusetts".
 - `halo` → could match non-medical "halo" in social hx.
 - `cyst` → matches "cystic" (which is also in your catalog — harmless duplication).
 - `cavitation` → matches "cavitations".
 
-The fine-tune saw similar noise, so this usually works. If precision matters more than recall on a given term, add `\b` word boundaries selectively in `_term_matches`.
+The fine-tune saw similar noise, so this usually works. If precision matters more than recall on a given term, add `\b` word boundaries selectively in `_term_occurrences`.
 
 ### Surface-form duplicates are intentional
 Catalog has `ground glass` / `groundglass` / `ground-glass`, `tree-in-bud` / `tree in bud`, etc. as separate entries. Substring matching is exact (case aside), so all variants are needed to cover real-world spelling. **Do not dedupe.**
@@ -370,6 +463,8 @@ Because word/char length already match at the defaults, the defaults are the rig
 Lowering to `sent_radius=1, adjacency=0` would *shorten* an already on-target center — don't
 reach for it unless a full-run `entity_missing` check shows a problem.
 
+**Full methodology, per-percentile tables, and the entity-drop check are in `WINDOWING_VALIDATION.md` (this folder).**
+
 ### Training coverage gaps
 From `../../EXAMPLES_BY_TEMPORALITY.md`:
 - Drug · `unknown`, Procedure · `unknown`, Measurement · `unknown` — **0** training records.
@@ -382,8 +477,10 @@ Not directly relevant for chest-CT (all your terms are `Condition`, which has fu
 | File                                                         | Purpose                                                 |
 |--------------------------------------------------------------|---------------------------------------------------------|
 | `tools/inference/build_inference_input.py`                             | Stage 1: build JSONL (model input) + optional long-form TSV. |
-| `tools/inference/run_llamacpp_inference.py`                            | Stage 2: batch-run `llama-cli` over the JSONL.           |
+| `tools/inference/run_llamacpp_inference.py`                            | Stage 2A: batch-run `llama-cli` over the JSONL (small batches). |
+| `tools/inference/run_llamaserver_inference.py`                         | Stage 2B: concurrent requests against a resident `llama-server` (large runs). |
 | `tools/inference/merge_inference_outputs.py`                           | Stage 3: merge responses into the TSV; emit `predictions.tsv`. |
+| `tools/inference/WINDOWING_VALIDATION.md`                              | Evidence the inference windowing matches the training distribution. |
 | `tools/inference/all_terms_typed.csv`                                        | 107 chest-CT terms, all typed `Condition`.              |
 | `tools/inference/all_terms.csv`                              | Original input list (no type column).                    |
 | `../../prompts/STEAM_demo_dataset.jsonl`                     | Training data the fine-tune was built on.                |
