@@ -44,7 +44,7 @@ former; the doctor/projection derives the latter.
 | Axis | Key | Values | Default | Question it answers |
 |---|---|---|---|---|
 | Negation | `negated` | `yes` / `no` | `no` | Does the author deny the entity? |
-| Certainty | `certainty` | `certain` / `likely` / `maybe` | `certain` | How strong is the author's commitment to the *polarized* claim? |
+| Certainty | `certainty` | `certain` / `possible` | `certain` | How strong is the author's commitment to the *polarized* claim? |
 | Realis | `realis` | `actual` / `hypothetical` | `actual` | Is occurrence asserted, or only entertained/contingent? |
 | Experiencer | `experiencer` | `self` / `family` / `other` | `self` | Who is presented as undergoing it? |
 | Temporality | `temporality` | `past` / `now` / `future` | `now` | When, by grammatical tense relative to note time? |
@@ -55,7 +55,7 @@ former; the doctor/projection derives the latter.
 {
   "entity": "pulmonary embolism",
   "negated": "no",
-  "certainty": "maybe",
+  "certainty": "possible",
   "realis": "actual",
   "experiencer": "self",
   "temporality": "now"
@@ -67,16 +67,16 @@ former; the doctor/projection derives the latter.
 - Negation is strictly binary; **every hedge routes to Certainty**, never to Negation.
 - `negated: no` = affirmed/present; `negated: yes` = denied/absent. (Default flips to `no`
   because most findings are not negated — guard against silent polarity inversion.)
-- "ruled out" → `negated: yes` + `certain`; "cannot rule out" / "?PE" → `negated: no` + `maybe`.
+- "ruled out" → `negated: yes` + `certain`; "cannot rule out" / "?PE" → `negated: no` + `possible`.
 
 - **Certainty grades the proposition *as polarized by* `negated` — not the bare finding.**
-  So `negated: yes` + `likely` means "**probably absent**," not "probably present." Stating
+  So `negated: yes` + `possible` means "**probably/possibly absent**," not "probably present." Stating
   this is mandatory: without it, two annotators silently split on whether certainty attaches
   to the finding or to its absence, and agreement on the axis collapses for a reason that
   looks like annotator noise but is actually a hole in the guideline. The convention is the
   FactBank polarity × modality cross-product:
 
-  | `negated` | `+ certain` | `+ likely` / `maybe` |
+  | `negated` | `+ certain` | `+ possible` |
   |---|---|---|
   | `no` (present) | definitely present (CT+) | probably / possibly present (PR+ / PS+) |
   | `yes` (absent) | definitely absent (CT−) | probably / possibly absent (PR− / PS−) |
@@ -93,6 +93,14 @@ former; the doctor/projection derives the latter.
     `hypothetical` (the action is conditioned)
   - real-but-triggered ("dyspnea on exertion") → `actual` (the trigger is **not** encoded —
     it survives as captured text for projection)
+  - *Gold-label mismatch (important if training/evaluating on i2b2):* the i2b2 / Spark-NLP
+    scheme labels triggered symptoms like "short of breath with one flight of stairs" as
+    **Conditional** — i.e. it lumps the case above with the irrealis-`if` case. Our split sends
+    those to **different** `realis` values, so i2b2 "Conditional" cannot be used as ground truth
+    for `realis` without an explicit remap (i2b2 Conditional → our `actual`-triggered **or**
+    `hypothetical`, decided per item). Note the same benchmark **merges** hypothetical +
+    conditional for its LLM runs — independent support for collapsing them onto one axis, but
+    also a sign the boundary is hard and label-noisy.
 
 - **Experiencer:** primary patient → `self`; named genetic relative → `family`;
   everyone/**everything** else → `other`. `other` is the deliberate catch-all for any
@@ -146,7 +154,9 @@ by the axes.
 ### Input contract
 
 - The model labels **one marked target entity at a time**, given a context window around it.
-  The LLM-era evidence puts the sweet spot at roughly **±2 sentences**.
+  One industry workshop benchmark (John Snow Labs, Text2Story'25) reports a sweet spot of
+  roughly **±2 sentences** — treat this as a starting heuristic to validate on your own notes,
+  not an established result, since it rests on a single vendor paper.
 - Coordinated lists produce **one record per entity**: "no fever, chills, or cough" → three
   entities, each `negated: yes`. Distributing polarity/certainty correctly across coordinated
   heads is a **scope** problem — the dominant documented failure in this task (NegEx ≈ 58% on
@@ -219,8 +229,11 @@ adding axes.
 
 - **No abstention.** Every axis forces a value, so genuinely unlabelable cases (and blank
   form items) become noise or fabricated positives. Filter non-assertions upstream; optionally
-  add an `assertion_present` flag. Note some boundaries are not reliably annotatable even by
-  experts (e.g., pneumonia-from-report κ ≈ 0.085) — forcing a hard label there biases
+  add an `assertion_present` flag. Note some clinical-interpretation boundaries are not
+  reliably annotatable even by experts — pneumonia-from-report agreement can be near-zero in
+  the hardest cases (a κ ≈ 0.085 figure is cited in the literature, but it is a task-specific
+  extreme; other chest-imaging annotation studies report κ ≈ 0.40–0.99), and "medical training
+  alone is not sufficient" for high agreement. Forcing a hard label on such cases biases
   evaluation against uncertainty.
 - **Genericity.** `other` + `hypothetical` keep boilerplate off the problem list but cannot
   distinguish a real third party / real contingency from generic template text. Prefer
@@ -230,7 +243,7 @@ adding axes.
   makes the *common* classes cleaner and each decision auditable, but it **relocates** the
   hard conditional/hypothetical (and `actual`-`future` vs `hypothetical`) boundary into
   `realis` rather than removing it — the literature's largest model gaps sit exactly there.
-  Over-sample the rare values (`maybe`, `hypothetical`, `family`/`other`) and the scope cases;
+  Over-sample the rare values (`possible`, `hypothetical`, `family`/`other`) and the scope cases;
   natural frequency starves them.
 - **Cross-source transfer is not free.** A scheme validated on one note type need not survive
   another ("Negation's not solved," Wu 2014). Evaluate across sources, not just on one corpus.
@@ -246,11 +259,20 @@ the orthogonal axes above, not annotated.
 - **`hypothetical` tokenization** — verify single-token in the target tokenizer (bare and
   leading-space); fall back to `if` if it fragments. The only value with a possible hard
   failure.
-- **Certainty cardinality** — keep 3-way, but collapse to 2-way `certain`/`maybe` if
-  inter-annotator agreement on the `likely`/`maybe` boundary fails in a pilot. **Validate
-  model calibration too, not just annotator agreement**: models skew toward extreme responses
-  and can collapse `likely` → `certain` even when annotators agree, so check certainty
-  calibration explicitly on held-out data.
+- **Certainty cardinality (settled: 2-way `certain` / `possible`).** Collapsed from the
+  3-way `certain`/`likely`/`maybe` because the `likely`↔`maybe` boundary is the one humans do
+  not reliably annotate, and a 2-way split avoids starving a third small class. This is the
+  field's **converged choice**, not just a defensive fallback: a ConText-family study found a
+  certainty feature *lowered* accuracy; FactBank's own annotators agreed well on **certain**
+  (pairwise F1 ≈ 0.93 / 0.83 for CT+ / CT−) but poorly on the gradations (≈ 0.46–0.57 across
+  the probable/possible cells); and the 2024 MAVEN-Fact dataset dropped "probable" entirely,
+  keeping CT+ / PS+ / PS− / CT− / Uu — i.e. exactly our `certain` vs `possible` split.
+  `possible` absorbs both former hedge levels and matches clinical usage ("possible
+  pneumonia"). Still to validate (not re-open): **model calibration** — models skew toward
+  extreme responses and can collapse `possible` → `certain`, so check certainty calibration
+  explicitly on held-out data. Re-introduce a third level only if a downstream rule genuinely
+  needs to separate *probable* from *possible* **and** a pilot shows that boundary can be
+  annotated reliably.
 - **Realis boundary** — the `actual`-`future` (issued plan) vs `hypothetical` (conditioned)
   call is the hardest, data-starved distinction; build and over-sample minimal pairs
   ("take aspirin daily" vs "if X, take aspirin"; "dyspnea on exertion" vs "if dyspnea, …").
@@ -260,4 +282,5 @@ the orthogonal axes above, not annotated.
   (`now`/`no`, `actual`/`hypothetical`) are live corruption risks with no key to catch them.
   Decide this before freezing the verbalizers.
 - **Tokenizer whitespace** and a **model-prior probe** (does the model already map each class
-  onto the chosen token?) before freezing.
+  onto the chosen token?) before freezing — including a single-token check on `possible` (bare
+  and leading-space), the newly chosen hedge verbalizer.
