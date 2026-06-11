@@ -45,7 +45,7 @@ are each independently requestable. A fully-labeled entity (and the maximal requ
 {
   "id": "E1",
   "type": "medication",
-  "section": "medications",
+  "section": "Last dose of Antibiotics",
   "negated": "no",
   "certainty": "certain",
   "realis": "actual",
@@ -100,7 +100,6 @@ surface cue that syntactically scopes this entity; no clinical inference.** The 
 | field | values | default | cue |
 |---|---|---|---|
 | `type` | medication / lab / problem / procedure / other | *(from upstream)* | entity kind |
-| `section` | chief_complaint / hpi / pmh / medications / allergies / family_history / social_history / ros / physical_exam / results / assessment_plan / hospital_course / discharge_diagnosis / discharge_instructions / other | **other** | nearest preceding section header / position in note |
 | `negated` | yes / no | **no** | negation operator (`no`, `denies`, `ruled out`, `without`) |
 | `certainty` | certain / possible | **certain** | hedge word (`likely`, `possible`, `?`, `concerning for`) |
 | `realis` | actual / hypothetical | **actual** | irrealis marker (`if`, `would`, contingent) |
@@ -113,6 +112,7 @@ surface cue that syntactically scopes this entity; no clinical inference.** The 
 
 | field | holds | example |
 |---|---|---|
+| `section` | note section the entity sits under — **verbatim header span**; `unknown` if none (not `null`) | `Hospital Course`, `HPI`, `Discharge Medications` |
 | `value` | the entity's quantity — med dose amount, lab/vital result, problem stage; any operator (`>`/`<`) stays in the span | `40`, `<0.01`, `109/50`, `IIIb` |
 | `unit` | unit for `value` | `mg`, `mcg/Kg/min`, `K/uL`, `mmHg` |
 | `reference_range` | normal range as written (verbatim span) | `57-99`, `<200` |
@@ -137,9 +137,10 @@ Notes:
 - **`abnormal_flag` is the *stated* flag only** — the `H`/`L`, `elevated`, `critically low`, `wnl`
   the author wrote. It is **never computed** from `value` vs `reference_range`; `WBC 14` with no
   written flag → `abnormal_flag=null` even though 14 is high. (See invariant §8.5.)
-- **`section` is universal context** — the note section the entity sits in, read from the nearest
-  preceding header (`Hospital Course:`, `PMH:`, `Discharge Medications:`); default `other` when the
-  note has no section structure. It both disambiguates other axes (PMH→`temporality=past`,
+- **`section` is a universal context span** — the **verbatim** section header the entity sits under
+  (`Hospital Course`, `PMH`, `Discharge Medications`), captured as written because real headers vary
+  far too much for a fixed list; **`unknown`** when no header is identifiable (not `null`). Normalize
+  to a canonical section downstream. It disambiguates other axes (PMH→`temporality=past`,
   FamHx→`experiencer=family`) and maps to OMOP `NOTE_NLP.section_concept_id`.
 
 ## 5. Which fields you'd typically request per `type` (caller / labeler guidance)
@@ -205,7 +206,7 @@ off-distribution. Keep canonical order in every subset so the frame stays predic
 | `realis` | actual / hypothetical | actual | i2b2-2010 conditional/hypothetical; i2b2-2012 modality | — |
 | `experiencer` | self / family / other | self | i2b2-2010 not-patient; cTAKES subject | — |
 | `temporality` | past / now / future | now | i2b2-2012 temporal; CMED temporality | absorbs resolved→past, resolving→now |
-| `section` | 15 note sections (chief_complaint … other) | other | OMOP `NOTE_NLP.section_concept_id`; medspaCy/SecTag; SOAP structure | universal; subsumes most source/asserter signal |
+| `section` | verbatim header span; `unknown` if none | unknown | OMOP `NOTE_NLP.section_concept_id`; medspaCy/SecTag; SOAP structure | varied headers → span, not a closed set; subsumes most source/asserter signal; normalize downstream |
 | `status` | started / stopped / increased / decreased / none | none | CMED Action set | dropped `continued`+`unchanged` → single `none` |
 | `severity` | mild / moderate / severe / unspecified | unspecified | cTAKES severity; FHIR Condition.severity | — |
 | `value`+`unit` | verbatim span | null | i2b2-2009 dosage; FHIR Observation.value/unit | generalizes med dose + lab result + stage; operator (`>`/`<`) kept in span |
@@ -262,10 +263,10 @@ Child-Pugh — degrade into `value`+`unit`, e.g. `value="II"`, `unit="NYHA"`.)
 - **`severity` / `body_site`**: cTAKES nine-attribute set + FHIR Condition.severity/bodySite.
   (`course`, cTAKES-only, dropped.)
 - **`section`**: clinical-note SOAP/section structure; maps to OMOP `NOTE_NLP.section_concept_id`.
-  Mature deterministic segmenters (medspaCy clinical sections, SecTag) are an alternative source, but
-  here the model reads the nearest header directly. High value: routes content (A&P / Hospital Course
-  / Discharge Instructions are the sections clinician info-needs studies rank highest) and
-  disambiguates temporality/experiencer.
+  Captured as the **verbatim header span** (real headers vary too much for a fixed set; normalize to
+  a canonical section downstream — medspaCy clinical sections / SecTag). High value: routes content
+  (A&P / Hospital Course / Discharge Instructions are the sections clinician info-needs studies rank
+  highest) and disambiguates temporality/experiencer.
 - **Lab/Observation result cluster** (`value`/`unit`/`reference_range`/`abnormal_flag`/`specimen`):
   FHIR Observation.value[x] / referenceRange / interpretation / specimen — labs are
   modeled almost only by FHIR; the i2b2/n2c2 NER tasks treat them as bare "test" concepts.
