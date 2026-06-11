@@ -38,7 +38,7 @@ field subsets from it to create training examples (§6). Container is unchanged:
 
 ## 2. The field menu (canonical order, names, vocabulary)
 
-`id` is the anchor — **always emitted** so the object maps back to the marker. The 12 fields below
+`id` is the anchor — **always emitted** so the object maps back to the marker. The 19 fields below
 are each independently requestable. A fully-labeled entity (and the maximal request) looks like:
 
 ```json
@@ -54,6 +54,13 @@ are each independently requestable. A fully-labeled entity (and the maximal requ
   "severity": "unspecified",
   "value": null,
   "unit": null,
+  "comparator": null,
+  "reference_range": null,
+  "abnormal_flag": null,
+  "specimen": null,
+  "route": "IV",
+  "frequency": null,
+  "duration": null,
   "date": "[**2177-3-15**] 02:48 AM",
   "body_site": null
 }
@@ -101,12 +108,19 @@ surface cue that syntactically scopes this entity; no clinical inference.** The 
 | `status` | started / stopped / increased / decreased / none | **none** | med change verb (`started on`, `d/c'd`, `increased to`) |
 | `severity` | mild / moderate / severe / unspecified | **unspecified** | severity word (`mild`, `severe`, `massive`, `trace`) |
 
-**Span fields (verbatim span or `null`):**
+**Result & span fields (verbatim span or stated closed cue; `null` unless written):**
 
-| field | holds | example span |
+| field | holds | example |
 |---|---|---|
 | `value` | the entity's quantity — med dose amount, lab/vital result, problem stage | `40`, `14`, `109/50`, `IIIb` |
 | `unit` | unit for `value` | `mg`, `mcg/Kg/min`, `K/uL`, `mmHg` |
+| `comparator` | operator on a numeric result — `>` / `<` / `>=` / `<=` / `~` (closed) | `troponin <0.01` → `<` |
+| `reference_range` | normal range as written (verbatim span) | `57-99`, `<200` |
+| `abnormal_flag` | **stated** interpretation — `normal` / `low` / `high` / `critical` / `abnormal` (closed) | `(H)`→high, `elevated`→high, `wnl`→normal |
+| `specimen` | sample source (verbatim span) — also serves microbiology | `blood`, `urine`, `CSF`, `sputum` |
+| `route` | medication route | `PO`, `IV`, `topical` |
+| `frequency` | medication sig | `BID`, `q6h`, `PRN` |
+| `duration` | how long (med course or symptom duration) | `x 7 days`, `for 3 weeks` |
 | `date` | date/time tied to the entity | `[**2177-3-15**]`, `POD 2` |
 | `body_site` | anatomical location | `RLL`, `left heel` |
 
@@ -118,8 +132,11 @@ Notes:
 - **Compound values stay as one raw span** (`value="109/50"`) — splitting is a downstream parse.
 - **`value`+`unit` is generalized:** dose for meds, result for labs/vitals, stage for problems —
   one pattern, not per-type slots.
-- **No `route` / `frequency`.** Dropped — the dose (`value`+`unit`) carries the medication quantity;
-  route/sig are low-value med-reconciliation detail, easy to re-add to the menu if ever needed.
+- **`route` / `frequency` / `duration`** complete the i2b2-2009 / n2c2-2018 medication signature
+  (dose + route + sig + duration). Selectable, so they cost no tokens unless requested.
+- **`abnormal_flag` is the *stated* flag only** — the `H`/`L`, `elevated`, `critically low`, `wnl`
+  the author wrote. It is **never computed** from `value` vs `reference_range`; `WBC 14` with no
+  written flag → `abnormal_flag=null` even though 14 is high. (See invariant §8.5.)
 
 ## 5. Which fields you'd typically request per `type` (caller / labeler guidance)
 
@@ -128,10 +145,10 @@ request* (and which to label), not a shape rule:
 
 | type | usually request | rarely meaningful |
 |---|---|---|
-| `medication` | axes, `status`, `value`+`unit` (dose), `date` | `severity`, `body_site` |
-| `lab` (incl. vital) | axes, `value`+`unit` (result), `date` | `status`, `severity` |
-| `problem` | axes, `severity`, `value`+`unit` (stage), `body_site`, `date` | `status` |
-| `procedure` | axes, `body_site`, `date` | `status`, `severity`, `value`, `unit` |
+| `medication` | axes, `status`, `value`+`unit` (dose), `route`, `frequency`, `duration`, `date` | `severity`, `body_site`, result fields |
+| `lab` (incl. vital) | axes, `value`+`unit` (result), `comparator`, `reference_range`, `abnormal_flag`, `specimen`, `date` | `status`, `severity`, `route`, `frequency` |
+| `problem` | axes, `severity`, `value`+`unit` (stage), `body_site`, `duration`, `date` | `status`, `route`, `frequency`, result fields |
+| `procedure` | axes, `body_site`, `date` | `status`, `severity`, `value`, `unit`, `route`, `frequency` |
 | `other` | axes only | the rest |
 
 ## 6. Generation & training format
@@ -151,8 +168,9 @@ off-distribution. Keep canonical order in every subset so the frame stays predic
 
 ## 7. Backward compatibility with the current data
 
-- Today's `training_data_all.jsonl` labels 5 axes per entity. The full menu adds 7 fields: `type`,
-  `status`, `severity`, `value`, `unit`, `date`, `body_site` (route/frequency are *not* added).
+- Today's `training_data_all.jsonl` labels 5 axes per entity. The full menu adds 14 fields: `type`,
+  `status`, `severity`, `value`, `unit`, `comparator`, `reference_range`, `abnormal_flag`,
+  `specimen`, `route`, `frequency`, `duration`, `date`, `body_site`.
 - Migration: keep the 5 axis values; add `type` (upstream; default `other`), `status=none`,
   `severity=unspecified`, span fields `=null`. No information loss — the new fields then get
   **labeled** in a separate pass.
@@ -167,7 +185,9 @@ off-distribution. Keep canonical order in every subset so the frame stays predic
    knowledge.
 3. Span-faithful: span fields hold the **verbatim** text; normalization is a separate downstream pass.
 4. Syntactic scope governs both axis flips and span attachment.
-5. No interpretive fields computed from reference knowledge (the reason `abnormal_flag` was dropped).
+5. No *computed* interpretive fields — `abnormal_flag` captures only the flag the author **wrote**
+   (`H`/`L`/`elevated`/`wnl`), never derived from `value` vs `reference_range`. Capturing a stated
+   cue is text-faithful; computing one from world/reference knowledge is not.
 6. The model emits **exactly the requested fields, in canonical order** — never more, never fewer,
    never reordered.
 
@@ -183,6 +203,13 @@ off-distribution. Keep canonical order in every subset so the frame stays predic
 | `status` | started / stopped / increased / decreased / none | none | CMED Action set | dropped `continued`+`unchanged` → single `none` |
 | `severity` | mild / moderate / severe / unspecified | unspecified | cTAKES severity; FHIR Condition.severity | — |
 | `value`+`unit` | verbatim span | null | i2b2-2009 dosage; FHIR Observation.value/unit | generalizes med dose + lab result + stage |
+| `comparator` | `>`/`<`/`>=`/`<=`/`~` | null | FHIR value-qualifier; lab convention | operator on a numeric result |
+| `reference_range` | verbatim span | null | FHIR Observation.referenceRange | re-added to the result cluster |
+| `abnormal_flag` | normal/low/high/critical/abnormal | null | FHIR Observation.interpretation | **stated flag only, never computed** (§8.5) |
+| `specimen` | verbatim span | null | FHIR Observation.specimen | also serves microbiology |
+| `route` | verbatim span | null | i2b2-2009 mode; n2c2-2018 Route; FHIR Dosage.route | — |
+| `frequency` | verbatim span | null | i2b2-2009/MedEx frequency; FHIR Dosage.timing | — |
+| `duration` | verbatim span | null | i2b2-2009 duration; i2b2-2012 TIMEX DURATION | — |
 | `date` | verbatim span | null | i2b2-2012 TIMEX3 | normalization downstream (MIMIC dates shifted) |
 | `body_site` | verbatim span | null | cTAKES body location; FHIR bodySite | — |
 
@@ -191,20 +218,19 @@ off-distribution. Keep canonical order in every subset so the frame stays predic
   shape), trained with varying subsets. Minimal tokens; "conditional field" question moves to the caller.
 - **Flat + span-only** — no `axes`/`slots` nesting, no `{span, normalized}` objects.
 - **Generalized** — med `dose` and lab `value` merged into `value`+`unit` (+ problem stage).
-- **Dropped** (see §10) — `route`, `frequency`, `indication` relation, `components[]` list,
-  `reference_range`, `specimen`, `form`, `abnormal_flag`, `duration`, `scale_value`, `course` axis.
+- **Dropped** (see §10) — `indication` relation, `components[]` list, `form`, `scale_value`,
+  `course` axis.
 
 ## 10. Out of scope / dropped (and why)
 
 **Dropped to keep the menu lean and the target flat** (re-addable if an eval justifies it):
-- `route`, `frequency` — low-value medication-reconciliation detail; the dose (`value`+`unit`)
-  carries the medication quantity.
 - `indication` — a cross-entity relation; references are the most error-prone generative output.
 - `components[]` — a variable-length list (BP/ABG parts); kept as one raw `value` span instead.
-- `reference_range`, `specimen`, `form`, `duration`, `scale_value` — long-tail; `scale_value` folds
-  into `value`+`unit`.
-- `abnormal_flag` — interpretive (high/low from a range) → violates invariant §8.5.
+- `form`, `scale_value` — long-tail; `scale_value` folds into `value`+`unit`.
 - `{span, normalized}` nesting — normalization moved downstream.
+
+(`abnormal_flag`, `reference_range`, `specimen` were previously here but are now **in** the menu —
+`abnormal_flag` as a strict text-cue, not a computed interpretation. See §4 and invariant §8.5.)
 
 **Out of scope entirely** (specialty-registry universe): oncology biomarkers (PD-L1 CPS/TPS),
 genomic mutation status, tumor response/progression dates, performance status as its own pipeline,
@@ -213,16 +239,19 @@ Child-Pugh — degrade into `value`+`unit`, e.g. `value="II"`, `unit="NYHA"`.)
 
 ## 11. Evidence base & sources
 
-- **Medication attributes**: i2b2-2009, MedEx, n2c2-2018, FHIR Dosage. v3 keeps the highest-value
-  subset (`value`/`unit` = dose, `status` = change) and drops `route`/`frequency`/`form`/`duration`.
+- **Medication attributes**: i2b2-2009, MedEx, n2c2-2018, FHIR Dosage. v3 keeps the full signature
+  (`value`/`unit` = dose, `route`, `frequency`, `duration`, `status` = change) and drops only `form`.
 - **Medication change events** (`status`): CMED 2021/2022 Action {Start, Stop, Increase, Decrease,
   UniqueDose, Unknown}.
 - **Assertion cluster** (the 5 axes): i2b2-2010 assertion, i2b2-2012 polarity+modality, cTAKES,
   medspaCy ConText, OMOP `term_modifiers`. Negation + certainty in every system.
 - **`severity` / `body_site`**: cTAKES nine-attribute set + FHIR Condition.severity/bodySite.
   (`course`, cTAKES-only, dropped.)
-- **Lab/Observation `value`/`unit`**: FHIR Observation.value[x]; NER shared tasks treat labs only as
-  bare "test" concepts.
+- **Lab/Observation result cluster** (`value`/`unit`/`comparator`/`reference_range`/`abnormal_flag`/
+  `specimen`): FHIR Observation.value[x] / referenceRange / interpretation / specimen — labs are
+  modeled almost only by FHIR; the i2b2/n2c2 NER tasks treat them as bare "test" concepts.
+  `abnormal_flag` mirrors FHIR `interpretation` (H/L/N/critical) but is captured **as written**, not
+  computed.
 - **Clinician information-needs**: Assessment & Plan dominates chart review (Brown 2014 67%; Clarke
   2014 92% of PCPs); discharge studies (Chatterton 2023; Sorita 2021; JGIM 2025) rank med changes +
   dates highly — motivating `status`, `value`, `date`.
