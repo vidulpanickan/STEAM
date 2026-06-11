@@ -38,7 +38,7 @@ field subsets from it to create training examples (§6). Container is unchanged:
 
 ## 2. The field menu (canonical order, names, vocabulary)
 
-`id` is the anchor — **always emitted** so the object maps back to the marker. The 20 fields below
+`id` is the anchor — **always emitted** so the object maps back to the marker. The 19 fields below
 are each independently requestable. A fully-labeled entity (and the maximal request) looks like:
 
 ```json
@@ -55,7 +55,6 @@ are each independently requestable. A fully-labeled entity (and the maximal requ
   "severity": "unspecified",
   "value": null,
   "unit": null,
-  "comparator": null,
   "reference_range": null,
   "abnormal_flag": null,
   "specimen": null,
@@ -114,9 +113,8 @@ surface cue that syntactically scopes this entity; no clinical inference.** The 
 
 | field | holds | example |
 |---|---|---|
-| `value` | the entity's quantity — med dose amount, lab/vital result, problem stage | `40`, `14`, `109/50`, `IIIb` |
+| `value` | the entity's quantity — med dose amount, lab/vital result, problem stage; any operator (`>`/`<`) stays in the span | `40`, `<0.01`, `109/50`, `IIIb` |
 | `unit` | unit for `value` | `mg`, `mcg/Kg/min`, `K/uL`, `mmHg` |
-| `comparator` | operator on a numeric result — `>` / `<` / `>=` / `<=` / `~` (closed) | `troponin <0.01` → `<` |
 | `reference_range` | normal range as written (verbatim span) | `57-99`, `<200` |
 | `abnormal_flag` | **stated** interpretation — `normal` / `low` / `high` / `critical` / `abnormal` (closed) | `(H)`→high, `elevated`→high, `wnl`→normal |
 | `specimen` | sample source (verbatim span) — also serves microbiology | `blood`, `urine`, `CSF`, `sputum` |
@@ -153,7 +151,7 @@ for the type-specific fields — *which subset to request* (and which to label),
 | type | usually request | rarely meaningful |
 |---|---|---|
 | `medication` | axes, `status`, `value`+`unit` (dose), `route`, `frequency`, `duration`, `date` | `severity`, `body_site`, result fields |
-| `lab` (incl. vital) | axes, `value`+`unit` (result), `comparator`, `reference_range`, `abnormal_flag`, `specimen`, `date` | `status`, `severity`, `route`, `frequency` |
+| `lab` (incl. vital) | axes, `value`+`unit` (result), `reference_range`, `abnormal_flag`, `specimen`, `date` | `status`, `severity`, `route`, `frequency` |
 | `problem` | axes, `severity`, `value`+`unit` (stage), `body_site`, `duration`, `date` | `status`, `route`, `frequency`, result fields |
 | `procedure` | axes, `body_site`, `date` | `status`, `severity`, `value`, `unit`, `route`, `frequency` |
 | `other` | axes only | the rest |
@@ -175,9 +173,9 @@ off-distribution. Keep canonical order in every subset so the frame stays predic
 
 ## 7. Backward compatibility with the current data
 
-- Today's `training_data_all.jsonl` labels 5 axes per entity. The full menu adds 15 fields: `type`,
-  `section`, `status`, `severity`, `value`, `unit`, `comparator`, `reference_range`,
-  `abnormal_flag`, `specimen`, `route`, `frequency`, `duration`, `date`, `body_site`.
+- Today's `training_data_all.jsonl` labels 5 axes per entity. The full menu adds 14 fields: `type`,
+  `section`, `status`, `severity`, `value`, `unit`, `reference_range`, `abnormal_flag`, `specimen`,
+  `route`, `frequency`, `duration`, `date`, `body_site`.
 - Migration: keep the 5 axis values; add `type` (upstream; default `other`), `status=none`,
   `severity=unspecified`, span fields `=null`. No information loss — the new fields then get
   **labeled** in a separate pass.
@@ -210,8 +208,7 @@ off-distribution. Keep canonical order in every subset so the frame stays predic
 | `section` | 15 note sections (chief_complaint … other) | other | OMOP `NOTE_NLP.section_concept_id`; medspaCy/SecTag; SOAP structure | universal; subsumes most source/asserter signal |
 | `status` | started / stopped / increased / decreased / none | none | CMED Action set | dropped `continued`+`unchanged` → single `none` |
 | `severity` | mild / moderate / severe / unspecified | unspecified | cTAKES severity; FHIR Condition.severity | — |
-| `value`+`unit` | verbatim span | null | i2b2-2009 dosage; FHIR Observation.value/unit | generalizes med dose + lab result + stage |
-| `comparator` | `>`/`<`/`>=`/`<=`/`~` | null | FHIR value-qualifier; lab convention | operator on a numeric result |
+| `value`+`unit` | verbatim span | null | i2b2-2009 dosage; FHIR Observation.value/unit | generalizes med dose + lab result + stage; operator (`>`/`<`) kept in span |
 | `reference_range` | verbatim span | null | FHIR Observation.referenceRange | re-added to the result cluster |
 | `abnormal_flag` | normal/low/high/critical/abnormal | null | FHIR Observation.interpretation | **stated flag only, never computed** (§8.5) |
 | `specimen` | verbatim span | null | FHIR Observation.specimen | also serves microbiology |
@@ -235,6 +232,8 @@ off-distribution. Keep canonical order in every subset so the frame stays predic
 - `indication` — a cross-entity relation; references are the most error-prone generative output.
 - `components[]` — a variable-length list (BP/ABG parts); kept as one raw `value` span instead.
 - `form`, `scale_value` — long-tail; `scale_value` folds into `value`+`unit`.
+- `comparator` — the operator (`>`/`<`/`≤`) stays inside the `value` span (`<0.01`, `>90%`) instead
+  of a dedicated field.
 - `{span, normalized}` nesting — normalization moved downstream.
 
 (`abnormal_flag`, `reference_range`, `specimen` were previously here but are now **in** the menu —
@@ -267,8 +266,8 @@ Child-Pugh — degrade into `value`+`unit`, e.g. `value="II"`, `unit="NYHA"`.)
   here the model reads the nearest header directly. High value: routes content (A&P / Hospital Course
   / Discharge Instructions are the sections clinician info-needs studies rank highest) and
   disambiguates temporality/experiencer.
-- **Lab/Observation result cluster** (`value`/`unit`/`comparator`/`reference_range`/`abnormal_flag`/
-  `specimen`): FHIR Observation.value[x] / referenceRange / interpretation / specimen — labs are
+- **Lab/Observation result cluster** (`value`/`unit`/`reference_range`/`abnormal_flag`/`specimen`):
+  FHIR Observation.value[x] / referenceRange / interpretation / specimen — labs are
   modeled almost only by FHIR; the i2b2/n2c2 NER tasks treat them as bare "test" concepts.
   `abnormal_flag` mirrors FHIR `interpretation` (H/L/N/critical) but is captured **as written**, not
   computed.
