@@ -38,13 +38,14 @@ field subsets from it to create training examples (§6). Container is unchanged:
 
 ## 2. The field menu (canonical order, names, vocabulary)
 
-`id` is the anchor — **always emitted** so the object maps back to the marker. The 19 fields below
+`id` is the anchor — **always emitted** so the object maps back to the marker. The 20 fields below
 are each independently requestable. A fully-labeled entity (and the maximal request) looks like:
 
 ```json
 {
   "id": "E1",
   "type": "medication",
+  "section": "medications",
   "negated": "no",
   "certainty": "certain",
   "realis": "actual",
@@ -100,6 +101,7 @@ surface cue that syntactically scopes this entity; no clinical inference.** The 
 | field | values | default | cue |
 |---|---|---|---|
 | `type` | medication / lab / problem / procedure / other | *(from upstream)* | entity kind |
+| `section` | chief_complaint / hpi / pmh / medications / allergies / family_history / social_history / ros / physical_exam / results / assessment_plan / hospital_course / discharge_diagnosis / discharge_instructions / other | **other** | nearest preceding section header / position in note |
 | `negated` | yes / no | **no** | negation operator (`no`, `denies`, `ruled out`, `without`) |
 | `certainty` | certain / possible | **certain** | hedge word (`likely`, `possible`, `?`, `concerning for`) |
 | `realis` | actual / hypothetical | **actual** | irrealis marker (`if`, `would`, contingent) |
@@ -137,11 +139,16 @@ Notes:
 - **`abnormal_flag` is the *stated* flag only** — the `H`/`L`, `elevated`, `critically low`, `wnl`
   the author wrote. It is **never computed** from `value` vs `reference_range`; `WBC 14` with no
   written flag → `abnormal_flag=null` even though 14 is high. (See invariant §8.5.)
+- **`section` is universal context** — the note section the entity sits in, read from the nearest
+  preceding header (`Hospital Course:`, `PMH:`, `Discharge Medications:`); default `other` when the
+  note has no section structure. It both disambiguates other axes (PMH→`temporality=past`,
+  FamHx→`experiencer=family`) and maps to OMOP `NOTE_NLP.section_concept_id`.
 
 ## 5. Which fields you'd typically request per `type` (caller / labeler guidance)
 
-`type` no longer gates anything — it is just a field. This table is guidance for *which subset to
-request* (and which to label), not a shape rule:
+`type` no longer gates anything — it is just a field. The 5 axes **and `section`** are *universal*
+context (meaningful for every entity, requestable regardless of type); the table below is guidance
+for the type-specific fields — *which subset to request* (and which to label), not a shape rule:
 
 | type | usually request | rarely meaningful |
 |---|---|---|
@@ -168,9 +175,9 @@ off-distribution. Keep canonical order in every subset so the frame stays predic
 
 ## 7. Backward compatibility with the current data
 
-- Today's `training_data_all.jsonl` labels 5 axes per entity. The full menu adds 14 fields: `type`,
-  `status`, `severity`, `value`, `unit`, `comparator`, `reference_range`, `abnormal_flag`,
-  `specimen`, `route`, `frequency`, `duration`, `date`, `body_site`.
+- Today's `training_data_all.jsonl` labels 5 axes per entity. The full menu adds 15 fields: `type`,
+  `section`, `status`, `severity`, `value`, `unit`, `comparator`, `reference_range`,
+  `abnormal_flag`, `specimen`, `route`, `frequency`, `duration`, `date`, `body_site`.
 - Migration: keep the 5 axis values; add `type` (upstream; default `other`), `status=none`,
   `severity=unspecified`, span fields `=null`. No information loss — the new fields then get
   **labeled** in a separate pass.
@@ -200,6 +207,7 @@ off-distribution. Keep canonical order in every subset so the frame stays predic
 | `realis` | actual / hypothetical | actual | i2b2-2010 conditional/hypothetical; i2b2-2012 modality | — |
 | `experiencer` | self / family / other | self | i2b2-2010 not-patient; cTAKES subject | — |
 | `temporality` | past / now / future | now | i2b2-2012 temporal; CMED temporality | absorbs resolved→past, resolving→now |
+| `section` | 15 note sections (chief_complaint … other) | other | OMOP `NOTE_NLP.section_concept_id`; medspaCy/SecTag; SOAP structure | universal; subsumes most source/asserter signal |
 | `status` | started / stopped / increased / decreased / none | none | CMED Action set | dropped `continued`+`unchanged` → single `none` |
 | `severity` | mild / moderate / severe / unspecified | unspecified | cTAKES severity; FHIR Condition.severity | — |
 | `value`+`unit` | verbatim span | null | i2b2-2009 dosage; FHIR Observation.value/unit | generalizes med dose + lab result + stage |
@@ -232,6 +240,13 @@ off-distribution. Keep canonical order in every subset so the frame stays predic
 (`abnormal_flag`, `reference_range`, `specimen` were previously here but are now **in** the menu —
 `abnormal_flag` as a strict text-cue, not a computed interpretation. See §4 and invariant §8.5.)
 
+**Considered and declined:**
+- `source` / `asserter` axis (clinician/patient/family/other_provider/report) — a per-entity
+  evidentiality/attribution axis (the project's original dropped `seen`/`told` 6th axis). `section`
+  subsumes most of its signal (HPI/ROS→patient, Exam/Labs→clinician, FamHx→family, Radiology/Path→
+  report), so `section` was added instead. Re-addable if per-entity evidential reliability (e.g.
+  pharmacovigilance, symptom reliability) later needs the within-section distinction `section` can't make.
+
 **Out of scope entirely** (specialty-registry universe): oncology biomarkers (PD-L1 CPS/TPS),
 genomic mutation status, tumor response/progression dates, performance status as its own pipeline,
 SDoH, device attributes, demographics. (Ordinal scales clinicians do chart — ECOG/NYHA/GCS/
@@ -247,6 +262,11 @@ Child-Pugh — degrade into `value`+`unit`, e.g. `value="II"`, `unit="NYHA"`.)
   medspaCy ConText, OMOP `term_modifiers`. Negation + certainty in every system.
 - **`severity` / `body_site`**: cTAKES nine-attribute set + FHIR Condition.severity/bodySite.
   (`course`, cTAKES-only, dropped.)
+- **`section`**: clinical-note SOAP/section structure; maps to OMOP `NOTE_NLP.section_concept_id`.
+  Mature deterministic segmenters (medspaCy clinical sections, SecTag) are an alternative source, but
+  here the model reads the nearest header directly. High value: routes content (A&P / Hospital Course
+  / Discharge Instructions are the sections clinician info-needs studies rank highest) and
+  disambiguates temporality/experiencer.
 - **Lab/Observation result cluster** (`value`/`unit`/`comparator`/`reference_range`/`abnormal_flag`/
   `specimen`): FHIR Observation.value[x] / referenceRange / interpretation / specimen — labs are
   modeled almost only by FHIR; the i2b2/n2c2 NER tasks treat them as bare "test" concepts.
