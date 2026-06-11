@@ -1,9 +1,13 @@
-# SCHEMA_PRO — Expanded Per-Entity Clinical Schema (v2)
+# SCHEMA_PRO — Flat Per-Entity Clinical Schema (v3, LoRA target)
 
-The single source of truth for the STEAM_PRO schema — the original 5 assertion axes folded together
-with the research-backed additions. Two tiers per entity: **axes** (closed-class, default + explicit
-cue) and **slots** (open-vocabulary spans, null unless stated). `type` selects which axes & slots
-apply. Every design decision is referenced to its source standard in §9; out-of-scope choices and
+The single source of truth for the STEAM_PRO schema. Designed as a **generative / LoRA fine-tune
+target**: every entity emits **one flat JSON object with the exact same keys, in the same order** —
+no per-type variation, no nesting, no lists, no cross-entity relations. A fixed frame + mostly
+closed-vocabulary values is what a LoRA model learns to reproduce reliably; varying shape is what
+makes it emit malformed output. Slot values are the **verbatim text span** copied from the note;
+unit/date normalization is a separate deterministic pass, never the model's job.
+
+Every design decision is referenced to its source standard in §9; out-of-scope choices and
 citations are in §10–11.
 
 ---
@@ -18,262 +22,239 @@ citations are in §10–11.
   "group": "real",
   "text": "... Last dose of Antibiotics:  [E1] Cefipime [/E1] - [**2177-3-15**] 02:48 AM ...",
   "entities": {
-    "E1": { /* entity object — see §2 */ }
+    "E1": { /* flat entity object — see §2 */ }
   }
 }
 ```
 
-## 2. Entity object
-
-Axes come in two groups: **5 universal** (every entity) + **conditional** axes that travel with the
-`type` (just like slots). Only the keys for this entity's type are present.
+## 2. Entity object (the one fixed shape — every entity, identical keys)
 
 ```json
 {
-  "entity": "Cefepime",          // normalized concept name (upstream)
-  "text":   "Cefipime",          // verbatim marked span
-  "type":   "medication",        // see §3 — selects the conditional axes AND the slot set
-
-  "axes": {
-    // universal — always present, every entity
-    "negated":     "no",         // yes | no
-    "certainty":   "certain",    // certain | possible
-    "realis":      "actual",     // actual | hypothetical
-    "experiencer": "self",       // self | family | other
-    "temporality": "past",       // past | now | future
-    // conditional — medication ⇒ status only (severity absent; it's for problems)
-    "status":      "stopped"     // started | stopped | increased | decreased | none
-  },
-
-  "slots": {                     // present keys depend on `type`; value is {…}|null, null = not stated
-    "date":      {"span": "[**2177-3-15**] 02:48 AM", "normalized": null},  // ⚠ MIMIC dates shifted
-    "duration":  null,
-    "body_site": null,
-    "dose":      null,
-    "route":     {"span": "Antibiotics", "normalized": "IV"},
-    "frequency": null,
-    "form":      null,
-    "indication":null
-  }
+  "id": "E1", "entity": "Cefipime",
+  "type": "medication",
+  "negated": "no",
+  "certainty": "certain",
+  "realis": "actual",
+  "experiencer": "self",
+  "temporality": "past",
+  "status": "stopped",
+  "severity": "unspecified",
+  "value": null,
+  "unit": null,
+  "route": "IV",
+  "frequency": null,
+  "date": "[**2177-3-15**] 02:48 AM",
+  "body_site": null
 }
 ```
 
-A **problem** entity instead carries `severity` (and no `status`):
+16 keys, always present, always in this order. `id` + `entity` (the verbatim marked span) come from
+the marker; the rest are predicted. Fields that don't apply to the entity hold their default
+(`status=none`, `severity=unspecified`) or `null` (the span fields). **No key is ever omitted** —
+that fixed frame is the whole point.
 
-```json
-"E7": {
-  "entity":"Pneumonia","text":"PNA","type":"problem",
-  "axes":{ "negated":"no","certainty":"possible","realis":"actual","experiencer":"self",
-           "temporality":"now","severity":"unspecified" },
-  "slots":{ "date":null,"duration":null,
-            "body_site":{"span":"RLL","normalized":"right lower lobe","laterality":"right"},
-            "scale_value":null }
-}
-```
+## 3. `type` and which fields it makes meaningful
 
-## 3. Entity types → which axes & slots are emitted
+`type` is now just an output field — it **no longer gates the shape** (all 16 keys are always
+emitted). It is a closed set, collapsed small for reliability:
 
-`type` ∈ `medication | lab | vital | problem | finding | procedure | other`. The **5 universal
-axes** and **universal slots** (`date`, `duration`, `body_site`) apply to all. Everything else is
-conditional — an entity only carries the keys for its type (others simply absent).
+`type` ∈ `medication | lab | problem | procedure | other`
+- vitals (HR, BP, SpO2) → `lab`; symptoms / exam findings → `problem`.
 
-| type | conditional axes | type-conditional slots |
+Which fields actually carry content per type (the rest stay at default/`null`):
+
+| type | typically populated | always default/null |
 |---|---|---|
-| `medication` | `status` | `dose` · `route` · `frequency` · `form` · `indication` |
-| `lab` / `vital` | — | `value` · `unit` · `reference_range` · `abnormal_flag` · `specimen` · `components[]` |
-| `problem` / `finding` | `severity` | `scale_value` |
-| `procedure` | — *(done/not-done via `negated`+`temporality`)* | (universal only) |
-| `other` | — | (universal only) |
+| `medication` | `status`, `value`+`unit` (dose), `route`, `frequency`, `date` | `severity` |
+| `lab` (incl. vital) | `value`+`unit` (result), `date` | `status`, `severity`, `route`, `frequency` |
+| `problem` | `severity`, `value`+`unit` (stage, e.g. `IIIb`/`AJCC`), `body_site`, `date` | `status`, `route`, `frequency` |
+| `procedure` | `body_site`, `date` | `status`, `severity`, `value`, `unit`, `route`, `frequency` |
+| `other` | (universal axes only) | the rest |
 
-## 4. AXES — values, defaults, decision rule
+This table is guidance for labelers, **not** a shape rule — the model always emits every key.
 
-All axes keep the RULES.md contract: **start from default, flip ONLY on an explicit surface cue
-that syntactically scopes this entity; no clinical inference.**
+## 4. Fields — values, defaults, decision rule
 
-**Universal (every entity):**
+The 7 closed-vocab axes keep the RULES.md contract: **start from default, flip ONLY on an explicit
+surface cue that syntactically scopes this entity; no clinical inference.** The 6 span fields are
+**`null` unless the value is explicitly written in the note**, and hold the **verbatim span**.
 
-| axis | values | default | flip cue |
+**Closed-vocabulary axes (always present):**
+
+| field | values | default | cue |
 |---|---|---|---|
+| `type` | medication / lab / problem / procedure / other | *(from upstream)* | entity kind |
 | `negated` | yes / no | **no** | negation operator (`no`, `denies`, `ruled out`, `without`) |
 | `certainty` | certain / possible | **certain** | hedge word (`likely`, `possible`, `?`, `concerning for`) |
 | `realis` | actual / hypothetical | **actual** | irrealis marker (`if`, `would`, contingent) |
 | `experiencer` | self / family / other | **self** | attribution (blood relative→family; non-blood/template→other) |
 | `temporality` | past / now / future | **now** | tense/time marker (`history of`→past; `will`/`plan`→future) |
+| `status` | started / stopped / increased / decreased / none | **none** | med change verb (`started on`, `d/c'd`, `increased to`) |
+| `severity` | mild / moderate / severe / unspecified | **unspecified** | severity word (`mild`, `severe`, `massive`, `trace`) |
 
-**Conditional (only on the owning type — see §3):**
+**Span fields (always present; verbatim span or `null`):**
 
-| axis | owner type | values | default | flip cue |
-|---|---|---|---|---|
-| `status` | medication | started / stopped / increased / decreased / none | **none** | change verb (`started on`, `d/c'd`, `increased to`, `decreased`) |
-| `severity` | problem / finding | mild / moderate / severe / unspecified | **unspecified** | severity word (`mild`, `severe`, `massive`, `trace`) |
+| field | holds | example span |
+|---|---|---|
+| `value` | the entity's quantity — med dose amount, lab/vital result, problem stage | `40`, `14`, `109/50`, `IIIb` |
+| `unit` | unit for `value` | `mg`, `mcg/Kg/min`, `K/uL`, `mmHg` |
+| `route` | medication route | `PO`, `IV`, `topical` |
+| `frequency` | medication sig | `BID`, `q6h`, `PRN` |
+| `date` | date/time tied to the entity | `[**2177-3-15**]`, `POD 2` |
+| `body_site` | anatomical location | `RLL`, `left heel` |
 
 Notes:
-- `status` is the medication **change action** (CMED Action set, minus its rarely-needed
-  UniqueDose/OtherChange). Default **`none`** = no change action stated, which covers an
-  explicitly *continued* med (`continue home meds` → `none`) as well as no mention. It makes the
-  old "discontinued → past" rule explicit: `discontinued` → `status=stopped`, `temporality=past`,
-  `negated=no` (still not a denial). `declined/refused/not done` stays `negated=yes` (it never
-  happened), `status=none`.
-- **No `course` axis.** Trend/resolution is carried by `temporality` + `negated`: `resolved` →
-  `temporality=past` (`negated=no`); `resolving` / `improving` / `worsening` → `temporality=now`
-  (still present). `severity` is independent of `status`/`temporality` and scopes the finding's
-  intensity only.
+- `status` is the medication **change action** (CMED). Default `none` covers both an explicitly
+  *continued* med (`continue home meds` → `none`) and no mention. Makes the old "discontinued → past"
+  rule explicit: `discontinued` → `status=stopped`, `temporality=past`, `negated=no`.
+  `declined/refused/not done` → `negated=yes`, `status=none`.
+- **No `course` axis.** Trend/resolution rides on `temporality`+`negated`: `resolved` →
+  `temporality=past`; `resolving`/`improving`/`worsening` → `temporality=now` (still present).
+- **Compound values stay as one raw span** (`value="109/50"`, `value="7.37/36/115"`) — we dropped the
+  per-component list to keep the shape flat; splitting BP/ABG is a downstream parse, not the model's.
+- **`value`+`unit` is generalized:** dose for meds, result for labs/vitals, stage for problems —
+  same two fields, so the model learns one pattern instead of per-type slots.
 
-## 5. SLOTS — definition & shape
+## 5. Worked examples (all identical 16-key shape)
 
-Every slot is `null` unless explicitly stated in the text. Each carries the **verbatim `span`**;
-normalization is a **separate field** so it can be audited/corrected independently (and so an
-unlearnable normalization — e.g. shifted MIMIC dates — degrades to `null` without losing the span).
-
-### Universal
-- `date` → `{span, normalized}` — absolute (`[**2177-3-14**]`) or relative (`POD 2`, `on admission`).
-  ⚠ MIMIC dates are de-identified/shifted: extract the span, leave `normalized` null.
-- `duration` → `{span, normalized}` — `x 7 days`, `for 3 weeks`.
-- `body_site` → `{span, normalized, laterality}` — anatomical location; `laterality` ∈
-  `left|right|bilateral|null`. Applies to findings/problems/procedures, not just procedures.
-
-### Medication
-- `dose` → `{span, value, unit}` — `40 mg` → `{40, "mg"}`; `0.03 mcg/Kg/min` → `{0.03, "mcg/kg/min"}`.
-- `route` → `{span, normalized}` — PO / IV / SC / topical / inhaled.
-- `frequency` → `{span, normalized}` — BID, q6h, PRN, daily (the medication sig, not symptom freq).
-- `form` → `{span, normalized}` — tablet, patch, infusion.
-- `indication` → **a relation, not a closed slot.** The reason a drug is given is open-ended and
-  often a whole clause (`"for volume overload"`, `"to prevent DVT given recent hip surgery"`), so it
-  is **not** normalized to a vocabulary. Shape: `{ref, span}` where `ref` is the **problem entity
-  id** the drug treats (`"E5"`) when that problem is separately marked — the n2c2-2018 Reason→Drug
-  relation — and `span` holds the verbatim reason text. `ref` is primary; `span` is the fallback
-  when no problem entity is co-marked. May be a **list** if a drug has multiple indications.
-
-### Lab / vital
-- `value` → `{span, parsed}` — numeric or coded result.
-- `unit` → `{span, normalized}` — UCUM where possible (`mEq/L`, `mcg/kg/min`).
-- `reference_range` → `{span, low, high}` — only if stated in text.
-- `abnormal_flag` → `high | low | normal | abnormal | null` — **text-cue only** (`elevated`, `H`/`L`
-  flag, `wnl`); never computed from reference knowledge.
-- `specimen` → `{span, normalized}` — blood / urine / CSF, if stated.
-- `components[]` → list of `{label, value, unit}` — for compound values: BP `109/50` →
-  `[{systolic,109,mmHg},{diastolic,50,mmHg}]`; ABG `7.37/36/115/22/-3` → pH/pCO2/pO2/HCO3/BE.
-
-### Problem / finding
-- `scale_value` → `{scale, value}` — ordinal value on a **named** scale: cancer `{TNM/Stage, "IIIb"}`,
-  `{CKD, "3"}`, `{ECOG, "2"}`, `{NYHA, "III"}`, `{GCS, "14"}`, `{Child-Pugh, "B"}`.
-
-## 6. Worked example (real record from `training_data_all.jsonl`)
-
-Source line: `Infusions:  [E2] Norepinephrine [/E2] - 0.03 mcg/Kg/min` and
-`Last dose of Antibiotics:  [E1] Cefipime [/E1] - [**2177-3-15**] 02:48 AM`.
+Medication — `Infusions:  [E2] Norepinephrine [/E2] - 0.03 mcg/Kg/min`:
 
 ```json
-"E2": {
-  "entity": "Norepinephrine", "text": "Norepinephrine", "type": "medication",
-  "axes": { "negated":"no","certainty":"certain","realis":"actual","experiencer":"self",
-            "temporality":"now","status":"none" },
-  "slots": {
-    "date":null, "duration":null, "body_site":null,
-    "dose":{"span":"0.03 mcg/Kg/min","value":0.03,"unit":"mcg/kg/min"},
-    "route":{"span":"Infusions","normalized":"IV"},
-    "frequency":{"span":"infusion","normalized":"continuous"},
-    "form":{"span":"Infusions","normalized":"infusion"},
-    "indication":null
-  }
+{
+  "id":"E2","entity":"Norepinephrine","type":"medication",
+  "negated":"no","certainty":"certain","realis":"actual","experiencer":"self","temporality":"now",
+  "status":"none","severity":"unspecified",
+  "value":"0.03","unit":"mcg/Kg/min","route":"IV","frequency":null,
+  "date":null,"body_site":null
 }
 ```
 
-Vital example — `HR: 89 (57 - 99) bpm` (no conditional axes; vitals carry only the universal 5):
+Lab/vital — `HR: 89 (57 - 99) bpm`:
 
 ```json
-"E9": {
-  "entity":"Heart rate","text":"HR","type":"vital",
-  "axes":{ "negated":"no","certainty":"certain","realis":"actual","experiencer":"self",
-           "temporality":"now" },
-  "slots":{
-    "date":null,"duration":null,"body_site":null,
-    "value":{"span":"89","parsed":89}, "unit":{"span":"bpm","normalized":"/min"},
-    "reference_range":{"span":"(57 - 99)","low":57,"high":99},
-    "abnormal_flag":null, "specimen":null, "components":[]
-  }
+{
+  "id":"E9","entity":"HR","type":"lab",
+  "negated":"no","certainty":"certain","realis":"actual","experiencer":"self","temporality":"now",
+  "status":"none","severity":"unspecified",
+  "value":"89","unit":"bpm","route":null,"frequency":null,
+  "date":null,"body_site":null
 }
 ```
 
-## 7. Backward compatibility with v1
+Problem — `... concerning for RLL [E7] pneumonia [/E7], improving`:
 
-- The v1 file stores the 5 axes **flat** on the entity (`{entity,text,negated,certainty,realis,
-  experiencer,temporality}`). v2 nests them under `axes` and adds `type`, the conditional axes, and
-  `slots`.
-- Migration: lift the 5 flat keys into `axes`, set `type` from upstream (or `other`), add the
-  conditional axes for that type at their defaults, set every slot to `null`. A v1 record becomes a
-  valid v2 record with no information loss — only new fields, all at defaults/null.
-- **Encoder (Option A)**: 5 always-on heads (universal axes) + per-type conditional heads
-  (`status` for meds, `severity` for problems/findings) trained with a **type-masked loss** — a
-  head is only supervised on entities of its owning type. Slots and relations (`indication`, components) are out of the
-  encoder's reach. **Generative (Option B)** emits the whole object in one pass — including the
-  conditional axes and the `indication` relation. This is the cleanest split: ship the encoder for
-  the axes, run the generative model (or a span-tagger + relation layer) for slots/relations.
+```json
+{
+  "id":"E7","entity":"pneumonia","type":"problem",
+  "negated":"no","certainty":"possible","realis":"actual","experiencer":"self","temporality":"now",
+  "status":"none","severity":"unspecified",
+  "value":null,"unit":null,"route":null,"frequency":null,
+  "date":null,"body_site":"RLL"
+}
+```
 
-## 8. Invariants (carried from RULES.md, enforced for every new field)
+(`certainty=possible` from "concerning for"; `temporality=now` carries "improving" — no course axis.)
 
-1. Default + explicit cue for every axis; `unspecified`/default is never inferred.
-2. Null unless surface evidence for every slot; no dose/date/flag imputed from world knowledge.
-3. Span-faithful: store the verbatim span; normalization is a separate, independently-auditable field.
-4. Syntactic scope governs both axis flips and slot attachment (a dose/date attaches to the entity
+## 6. Generation format (how these objects are served to the model)
+
+Per `build_chat_dataset.py`, one training example per note:
+- **system** = `FINAL_TRAINING_DATA/system_prompt.txt` (the schema contract).
+- **user** = `{"text_id": ..., "text": <note with all [Ei] … [/Ei] markers>}`.
+- **assistant** = a JSON **array** of the §2 objects, one per entity, **in marker order**.
+
+So the only structure the model produces is a list of identical flat objects — no nesting beyond the
+list, fixed keys throughout.
+
+## 7. Backward compatibility with the current data
+
+- Today's `training_data_all.jsonl` stores, per entity, `{id?, entity, negated, certainty, realis,
+  experiencer, temporality}` (5 axes only). v3 adds 9 keys: `type`, `status`, `severity`, `value`,
+  `unit`, `route`, `frequency`, `date`, `body_site`.
+- Migration of an existing record: keep the 5 axis values, add `type` (from upstream; default
+  `other`), `status=none`, `severity=unspecified`, and the 6 span fields `=null`. A v1 entity
+  becomes a valid v3 object with no information loss — only new fields, all at defaults/null. The new
+  fields then get **labeled** as a separate pass (they don't exist in the data yet).
+- **Primary path is generative + LoRA** (this schema is its target). An encoder can still consume the
+  8 closed-vocab fields (`type` + 7 axes) as classification heads; the 6 span fields require the
+  generative model or a span-tagger.
+
+## 8. Invariants (carried from RULES.md, enforced for every field)
+
+1. Default + explicit cue for every axis; a default is never inferred.
+2. `null` unless the value is written in the text for every span field; no dose/date imputed from
+   world knowledge.
+3. Span-faithful: span fields hold the **verbatim** text; normalization (UCUM, ISO date, numeric
+   parse) is a separate downstream pass, not in the label.
+4. Syntactic scope governs both axis flips and span attachment (a dose/date attaches to the entity
    it grammatically modifies, not the nearest token).
-5. `abnormal_flag` and any interpretive field are text-cue only — labeling a value from reference
-   knowledge reintroduces the LLM-judgment failure mode the project was built to avoid.
+5. No interpretive fields computed from reference knowledge — that was why `abnormal_flag` (high/low
+   from a reference range) was dropped: it reintroduces the LLM-judgment failure mode the project
+   avoids.
 
-## 9. Axis decision log (each value set → its source)
+## 9. Decision log (each field/value → its source)
 
-| axis | final values | default | source standard | note / overlap removed |
+| field | values | default | source standard | note |
 |---|---|---|---|---|
 | `negated` | yes / no | no | i2b2-2010 assertion; NegEx | — |
 | `certainty` | certain / possible | certain | i2b2-2010 (`possible`); cTAKES uncertainty | — |
 | `realis` | actual / hypothetical | actual | i2b2-2010 conditional/hypothetical; i2b2-2012 modality | — |
 | `experiencer` | self / family / other | self | i2b2-2010 not-patient; cTAKES subject | — |
 | `temporality` | past / now / future | now | i2b2-2012 temporal; CMED temporality | absorbs resolved→past, resolving→now |
-| `status` (med) | started / stopped / increased / decreased / **none** | none | CMED Action set | dropped `continued`+`unchanged` → single `none` |
-| `severity` (problem/finding) | mild / moderate / severe / unspecified | unspecified | cTAKES severity; FHIR Condition.severity | — |
-| ~~`course`~~ | — **dropped** — | — | cTAKES-only (not in FHIR/CMED/i2b2/n2c2) | overlapped `temporality`; removed |
+| `status` | started / stopped / increased / decreased / none | none | CMED Action set | dropped `continued`+`unchanged` → single `none` |
+| `severity` | mild / moderate / severe / unspecified | unspecified | cTAKES severity; FHIR Condition.severity | — |
+| `value`+`unit` | verbatim span | null | i2b2-2009 dosage; FHIR Observation.value/unit | generalizes med dose + lab result + stage |
+| `route` | verbatim span | null | i2b2-2009 mode; FHIR Dosage.route | — |
+| `frequency` | verbatim span | null | i2b2-2009/MedEx frequency; FHIR Dosage.timing | — |
+| `date` | verbatim span | null | i2b2-2012 TIMEX3 | normalization downstream (MIMIC dates shifted) |
+| `body_site` | verbatim span | null | cTAKES body location; FHIR bodySite | — |
 
-Two label-clarity fixes recorded here: **(a)** `status` collapsed the confusable `continued`/
-`unchanged` pair into one `none` default (CMED has no "continued" — a continued med is a *no-change*
-event); **(b)** `course` was evaluated and **dropped** — it is supported only by cTAKES and its
-informative values (`resolved`/`resolving`) already fall out of `temporality`, so it added a
-confusing axis with no cross-standard backing.
+**Normalization decisions (v3, for the LoRA target):**
+- **Flattened** — removed the `axes`/`slots` two-tier nesting and the `{span, normalized}` objects;
+  one flat object, span-only values.
+- **De-varied** — `status`/`severity` made always-present (not type-conditional) so the shape is
+  constant; `type` demoted from shape-gate to plain field.
+- **Generalized** — med `dose` and lab `value` merged into one `value`+`unit` pair (+ problem stage).
+- **Dropped** (see §10) — `indication` relation, `components[]` list, `reference_range`, `specimen`,
+  `form`, `abnormal_flag`, `duration`, `scale_value`, and the earlier-evaluated `course` axis.
 
-## 10. Out of scope (deliberately excluded)
+## 10. Out of scope / dropped (and why)
 
-Kept out to avoid over-generalizing a general clinical schema into specialty registries:
-oncology biomarkers (PD-L1 CPS/TPS), genomic mutation status, tumor response/progression dates,
-performance status as its own pipeline, SDoH/social determinants, device attributes, demographics.
-These are specialty-registry concerns (Flatiron/Tempus/Microsoft-UMA) with their own normalization
-vocabularies (ICD-O, MedDRA) and whole-history reasoning; they belong in a separate oncology/
-registry profile, not here. (Ordinal severity scales clinicians *do* chart in general notes —
-ECOG, NYHA, GCS, Child-Pugh — are captured generically by the `scale_value` slot, §5.)
+**Dropped to keep the LoRA target flat & fixed** (not because they're useless — they re-enter only
+if a later eval shows they're worth the shape cost):
+- `indication` — a cross-entity relation (drug→problem); references between entities are the most
+  error-prone thing a generative model emits.
+- `components[]` — a variable-length list (BP/ABG parts); kept instead as one raw `value` span.
+- `reference_range`, `specimen`, `form`, `duration`, `scale_value` — long-tail slots; `scale_value`
+  folds into `value`+`unit`.
+- `abnormal_flag` — interpretive (high/low from a range) → violates invariant §8.5.
+- `{span, normalized}` nesting — normalization moved to a deterministic downstream pass.
+
+**Out of scope entirely** (specialty-registry universe, separate profile): oncology biomarkers
+(PD-L1 CPS/TPS), genomic mutation status, tumor response/progression dates, performance status as
+its own pipeline, SDoH, device attributes, demographics. (Ordinal scales clinicians do chart —
+ECOG/NYHA/GCS/Child-Pugh — degrade into `value`+`unit` when written, e.g. `value="II"`, `unit="NYHA"`.)
 
 ## 11. Evidence base & sources
 
-- **Medication signature set** (name/strength/form/dose/route/frequency/duration/reason) is the most
-  universal attribute cluster: i2b2-2009, MedEx, n2c2-2018 (9 concepts + drug-anchored relations),
-  JSL posology, FHIR Dosage.
+- **Medication signature set** (name/dose/route/frequency/duration/reason): i2b2-2009, MedEx,
+  n2c2-2018, JSL posology, FHIR Dosage — the most universal attribute cluster. v3 keeps the highest-
+  value subset (`value`/`unit`/`route`/`frequency`) as flat span fields.
 - **Medication change events** (`status`): CMED 2021/2022 Action {Start, Stop, Increase, Decrease,
-  UniqueDose, OtherChange, Unknown} + negation/temporality/certainty/actor — the direct analogue of
-  the clinician "med changes" need.
-- **Assertion/context cluster** (the universal 5): i2b2-2010 assertion (present/absent/possible/
-  conditional/hypothetical/not-patient), i2b2-2012 polarity+modality, cTAKES, medspaCy ConText,
-  OMOP `term_modifiers`. Negation + certainty appear in *every* surveyed system.
-- **`severity` / `body_site`**: cTAKES nine-attribute set + FHIR Condition.severity/bodySite; JSL.
-  (cTAKES's `course` was the one attribute with no second source — hence dropped.)
-- **Lab/Observation semantics** (value/unit/referenceRange/interpretation/specimen/component):
-  modeled almost only by FHIR Observation; NER shared tasks treat labs as bare "test" concepts.
+  UniqueDose, Unknown} — the analogue of the clinician "med changes" need.
+- **Assertion cluster** (the 5 universal axes): i2b2-2010 assertion, i2b2-2012 polarity+modality,
+  cTAKES, medspaCy ConText, OMOP `term_modifiers`. Negation + certainty appear in every system.
+- **`severity` / `body_site`**: cTAKES nine-attribute set + FHIR Condition.severity/bodySite.
+  (`course`, cTAKES-only with no second source, was dropped.)
+- **Lab/Observation `value`/`unit`**: FHIR Observation.value[x]; NER shared tasks treat labs only as
+  bare "test" concepts, which is why the value/unit fields are needed.
 - **Clinician information-needs**: Assessment & Plan dominates chart review (Brown 2014 eye-tracking
-  67% of reading time; Clarke 2014 needed by 92% of PCPs). Discharge-summary studies (Chatterton
-  2023; Sorita 2021; JGIM 2025) rank med changes *with reasons + stop dates*, pending results/
-  follow-up *with dates*, and hospital course at the top — motivating `status`, `indication`,
-  `date`, `duration`.
+  67%; Clarke 2014 needed by 92% of PCPs); discharge studies (Chatterton 2023; Sorita 2021; JGIM
+  2025) rank med changes + dates highly — motivating `status`, `value`, `date`.
 - **Recent LLM-IE (2023-26)**: Agrawal EMNLP-2022 (few-shot med-attribute + med-status schema);
-  Microsoft UMA 2025 (short- vs long-context attribute-difficulty split); Flatiron progression+date
-  / PD-L1 7-field. Unanimous caveat: a raw span is insufficient — a separate deterministic
-  normalization layer (LOINC/units/RxNorm/dates) is required, which is why every slot keeps span
-  and normalized as distinct fields.
+  Microsoft UMA 2025; Flatiron progression+date / PD-L1. Unanimous caveat: a raw span is enough as
+  the *label*; normalization (LOINC/units/RxNorm/dates) is a separate deterministic layer — exactly
+  the span-only design here. Structured-output reliability scales with a **fixed, flat schema**.
 
 *Key sources: i2b2-2009 PMC2995676 · MedEx PMC2995636 · n2c2-2018 PMC7489085 · CMED PMC10529825 ·
 i2b2-2010 PMC3168320 · i2b2-2012 PMC3756273 · cTAKES Default Clinical Pipeline · FHIR
